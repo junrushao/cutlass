@@ -97,6 +97,7 @@ struct AttentionKernel {
     scalar_t* query_ptr; // [num_queries, num_heads, head_dim]
     scalar_t* key_ptr; // [num_keys, num_heads, head_dim]
     scalar_t* value_ptr; // [num_keys, num_heads, head_dim_value]
+    int32_t *mask_ptr = nullptr; // [batch, seq_len]
     int32_t* cu_seqlens_q_ptr = nullptr;
     int32_t* cu_seqlens_k_ptr = nullptr;
 
@@ -164,6 +165,7 @@ struct AttentionKernel {
         key_ptr += batch_id * k_strideB;
         value_ptr += batch_id * v_strideB;
         output_ptr += batch_id * o_strideB;
+        mask_ptr += batch_id * num_keys;
         if (output_accum_ptr != nullptr) {
           output_accum_ptr += batch_id * o_strideB;
         }
@@ -177,6 +179,7 @@ struct AttentionKernel {
       value_ptr += k_start * v_strideM + head_id * v_strideH;
       output_ptr += int64_t(q_start + query_start) * o_strideM() +
           head_id * o_strideH;
+      mask_ptr += k_start;
 
       if (output_accum_ptr != nullptr) {
         output_accum_ptr += int64_t(q_start + query_start) * o_strideM() +
@@ -205,6 +208,7 @@ struct AttentionKernel {
       value_ptr = warp_uniform(value_ptr);
       output_ptr = warp_uniform(output_ptr);
       output_accum_ptr = warp_uniform(output_accum_ptr);
+      mask_ptr = warp_uniform(mask_ptr);
       logsumexp_ptr = warp_uniform(logsumexp_ptr);
       num_queries = warp_uniform(num_queries);
       num_keys = warp_uniform(num_keys);
@@ -596,6 +600,42 @@ struct AttentionKernel {
             },
             [&](int accum_m) {});
       }
+
+      float scale = 1.0f / cutlass::fast_sqrt(float(p.head_dim));
+      if (p.mask_ptr != nullptr) {
+        auto lane_offset = MM0::ScalingCoefsUpdater::get_lane_offset(
+            lane_id(), warp_id(), iteratorC_tile_offset);
+        auto nop = [](int) -> void {};
+        auto f_apply_mask = [&](int accum_n, int idx) -> void {
+          int mask = *(p.mask_ptr + accum_n);
+          scalar_t adder = (scalar_t{1.0} - static_cast<scalar_t>(mask)) *
+                           scalar_t{-10000.0};
+          accum[idx] *= scale;
+          accum[idx] += adder;
+        };
+
+        if (p.num_keys - iter_key_start >= kKeysPerBlock) {
+          MM0::ScalingCoefsUpdater::iterateRows(
+              lane_offset, nop,
+              [&](int accum_m, int accum_n, int idx) -> void {
+                f_apply_mask(accum_n, idx);
+              },
+              nop);
+        } else {
+          MM0::ScalingCoefsUpdater::iterateRows(
+              lane_offset, nop,
+              [&](int accum_m, int accum_n, int idx) -> void {
+                if (accum_n < p.num_keys - iter_key_start) {
+                  f_apply_mask(accum_n, idx);
+                }
+              },
+              nop);
+        }
+
+        p.mask_ptr += kKeysPerBlock;
+        scale = 1.0f; // scale is no longer needed as it is merged into masking
+      }
+
       DISPATCH_BOOL(iter_key_start == 0, kIsFirst, ([&] {
                       DISPATCH_BOOL(
                           p.num_keys - iter_key_start >= kKeysPerBlock,
@@ -606,21 +646,12 @@ struct AttentionKernel {
                             // exp(accum[i] * scale
                             // - mi)
                             MM0::ScalingCoefsUpdater::update<
-                                kQueriesPerBlock,
-                                kFullColumns,
-                                kIsFirst,
-                                kKeepOutputInRF>(
-                                accum_o,
-                                accum,
-                                mi,
-                                m_prime,
-                                s_prime,
-                                lane_id(),
-                                thread_id(),
-                                warp_id(),
-                                p.num_keys - iter_key_start,
-                                iteratorC_tile_offset,
-                                1.0f / cutlass::fast_sqrt(float(p.head_dim)));
+                                kQueriesPerBlock, kFullColumns, kIsFirst,
+                                kKeepOutputInRF>(accum_o, accum, mi, m_prime,
+                                                 s_prime, lane_id(),
+                                                 thread_id(), warp_id(),
+                                                 p.num_keys - iter_key_start,
+                                                 iteratorC_tile_offset, scale);
                           }));
                     }));
 
